@@ -1,0 +1,316 @@
+import os
+import json
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+print("leu o arquivo")
+# Carrega variáveis do .env
+load_dotenv()
+
+# =============================
+# 🤖 CLAUDE (Anthropic)
+# =============================
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY")
+)
+
+# =============================
+# 📅 GOOGLE CALENDAR
+# =============================
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+
+# 🔁 COLE AQUI O ID DO SEU CALENDÁRIO
+CALENDAR_ID = '2497d870afd5e28857902efe29d09d41b5bcb516a179cf73db8d95d2e8086f44@group.calendar.google.com'
+
+# 🔥 True = não escreve no calendário
+DEMO_MODE = False
+
+# 🎨 CORES DO GOOGLE CALENDAR
+COLOR_MAP = {
+    "trabalho": "1",
+    "pessoal": "2",
+    "pausa": "5",
+    "almoço": "11",
+    "preparação": "9",
+    "saúde": "4",
+    "estudo": "10"
+}
+
+
+# =============================
+# 🔐 AUTENTICAÇÃO GOOGLE
+# =============================
+def authenticate_google():
+    creds = None
+
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            'credentials.json', SCOPES
+        )
+        creds = flow.run_local_server(port=0)
+
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+
+    return build('calendar', 'v3', credentials=creds)
+
+
+# =============================
+# 📥 BUSCAR EVENTOS
+# =============================
+def get_events(service):
+    now = datetime.utcnow().isoformat() + 'Z'
+    time_max = (datetime.utcnow() + timedelta(days=7)).isoformat() + 'Z'
+
+    events_result = service.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=now,
+        timeMax=time_max,
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute()
+
+    events = events_result.get('items', [])
+
+    formatted_events = []
+
+    for event in events:
+        start = event['start'].get('dateTime', event['start'].get('date'))
+        end = event['end'].get('dateTime', event['end'].get('date'))
+
+        formatted_events.append({
+            "id": event.get("id"),
+            "titulo": event.get("summary", "Sem título"),
+            "inicio": start,
+            "fim": end,
+            "descricao": event.get("description", ""),
+            "cor_atual": event.get("colorId", "sem cor")
+        })
+
+    return formatted_events
+
+def update_event(service, event_data):
+    event_id = event_data["id"]
+
+    existing_event = service.events().get(
+        calendarId=CALENDAR_ID,
+        eventId=event_id
+    ).execute()
+
+    existing_event["summary"] = event_data["titulo"]
+
+    existing_event["start"] = {
+        "dateTime": f"{event_data['data']}T{event_data['hora_inicio']}:00",
+        "timeZone": "America/Sao_Paulo",
+    }
+
+    existing_event["end"] = {
+        "dateTime": f"{event_data['data']}T{event_data['hora_fim']}:00",
+        "timeZone": "America/Sao_Paulo",
+    }
+
+    existing_event["colorId"] = COLOR_MAP.get(event_data["categoria"], "1")
+
+    service.events().update(
+        calendarId=CALENDAR_ID,
+        eventId=event_id,
+        body=existing_event
+    ).execute()
+
+
+# =============================
+# 🧠 PROMPT
+# =============================
+def build_prompt(events):
+    return f"""
+Você é um assistente pessoal inteligente especializado em organização de agenda semanal.
+
+Seu objetivo é reorganizar a agenda respeitando produtividade, bem-estar e importância dos eventos.
+
+REGRAS OBRIGATÓRIAS:
+- Não sobrepor eventos.
+- Trabalho deve acontecer entre 08:00 e 18:00.
+- Máximo de 8h de trabalho por dia.
+- Almoço deve acontecer entre 12:00 e 14:00, com pelo menos 1h.
+- Não agendar tarefas de trabalho durante o almoço.
+- Criar preparação de 10 minutos antes de reuniões importantes.
+- Criar pausas e descompressão quando houver sobrecarga mental.
+
+REGRAS PARA EVENTOS EXISTENTES:
+- Você pode alterar a cor de qualquer evento existente.
+- Você pode diminuir a duração de eventos existentes, se fizer sentido.
+- Você só pode alterar a data ou horário de eventos menos importantes.
+- Não altere data/horário de eventos importantes.
+- Considere como importantes eventos com nomes como: reunião importante, cliente, diretoria, entrevista, médico, apresentação, comitê, 1:1, mentoria.
+- Se não tiver certeza se um evento é importante, trate como importante e não altere data/horário.
+- Ao editar um evento existente, mantenha o mesmo id.
+
+CATEGORIAS:
+- trabalho
+- pessoal
+- pausa
+- almoço
+- preparação
+- saúde
+- estudo
+
+EVENTOS ATUAIS:
+{json.dumps(events, indent=2, ensure_ascii=False)}
+
+FORMATO DE SAÍDA:
+Retorne APENAS JSON válido.
+
+Use uma lista de ações no formato:
+
+[
+  {{
+    "acao": "update",
+    "id": "id_do_evento_existente",
+    "titulo": "novo ou mesmo título",
+    "data": "YYYY-MM-DD",
+    "hora_inicio": "HH:MM",
+    "hora_fim": "HH:MM",
+    "categoria": "trabalho | pessoal | pausa | almoço | preparação | saúde | estudo",
+    "motivo": "explique brevemente por que essa alteração foi feita"
+  }},
+  {{
+    "acao": "create",
+    "titulo": "novo evento",
+    "data": "YYYY-MM-DD",
+    "hora_inicio": "HH:MM",
+    "hora_fim": "HH:MM",
+    "categoria": "trabalho | pessoal | pausa | almoço | preparação | saúde | estudo",
+    "motivo": "explique brevemente por que esse evento foi criado"
+  }}
+]
+
+IMPORTANTE:
+- Não escreva texto fora do JSON.
+- Não use markdown.
+- Não use bloco de código.
+"""
+
+
+# =============================
+# 🤖 MODO API
+# =============================
+def call_claude_api(prompt):
+    response = client.messages.create(
+        model="claude-3-5-sonnet-20240620",
+        max_tokens=2000,
+        temperature=0.3,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.content[0].text
+
+
+# =============================
+# 🧑‍💻 MODO MANUAL
+# =============================
+def call_claude_manual(prompt):
+    print("\n📋 COPIE ESSE PROMPT E COLE NO CLAUDE:\n")
+    print(prompt)
+
+    print("\n✏️ Cole aqui o JSON de resposta:\n")
+    print("Quando terminar, digite FIM em uma linha separada e aperte Enter:\n")
+
+    lines = []
+
+    while True:
+        line = input()
+
+        if line.strip().upper() == "FIM":
+            break
+
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# =============================
+# 📅 CRIAR EVENTOS
+# =============================
+def apply_calendar_actions(service, actions):
+    for action in actions:
+        acao = action.get("acao")
+
+        if DEMO_MODE:
+            if acao == "update":
+                print(f"[DEMO] Atualizaria: {action['titulo']} | motivo: {action.get('motivo')}")
+            elif acao == "create":
+                print(f"[DEMO] Criaria: {action['titulo']} | motivo: {action.get('motivo')}")
+            continue
+
+        if acao == "update":
+            update_event(service, action)
+
+        elif acao == "create":
+            create_single_event(service, action)
+
+
+# =============================
+# 🎮 MENU CLI
+# =============================
+def select_mode():
+    print("\n=== 🤖 Selecione o modo ===")
+    print("1 - Manual (Claude web)")
+    print("2 - Automático (API)")
+
+    choice = input("\nEscolha (1 ou 2): ")
+
+    if choice == "1":
+        return "manual"
+    elif choice == "2":
+        return "api"
+    else:
+        print("⚠️ Usando modo manual por padrão")
+        return "manual"
+
+
+# =============================
+# 🚀 MAIN
+# =============================
+def main():
+    print("entrou na main")
+    mode = select_mode()
+
+    print(f"\n🚀 Modo: {mode}")
+
+    service = authenticate_google()
+    events = get_events(service)
+
+    prompt = build_prompt(events)
+
+    if mode == "api":
+        print("\n🤖 Chamando Claude via API...")
+        response_text = call_claude_api(prompt)
+    else:
+        print("\n🧑‍💻 Modo manual...")
+        response_text = call_claude_manual(prompt)
+
+    print("\n📊 Resposta:\n", response_text)
+
+    try:
+        parsed = json.loads(response_text)
+    except:
+        print("❌ Erro ao converter JSON")
+        return
+
+    print("\n📅 Criando eventos...")
+    create_single_event(service, parsed)
+
+    print("\n✅ Finalizado!")
+
+
+if __name__ == "__main__":
+    print("chamando a main")
+    main()
