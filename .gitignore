@@ -4,3 +4,5 @@ venv/
 __pycache__/
 credentials.jsoncredentials.json
 token.json
+credentials.json
+token.json
